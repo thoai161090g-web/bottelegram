@@ -110,10 +110,15 @@ def withdraw_money(access_token, amount):
         return False, "Thiếu Access Token đăng nhập."
     
     url = f"https://gameapi.tele68.com/v1/payment-app/cash-out/bank?cp=R&cl=R&pf=web&at={access_token}"
+    
+    # Bổ sung Authorization Header để tránh lỗi 401
     headers = {
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0'
+        'Authorization': f'Bearer {access_token}',
+        'accessToken': access_token,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
     }
+    
     payload = {
         "type": WITHDRAW_BANK_TYPE,
         "number": WITHDRAW_BANK_NUMBER,
@@ -121,16 +126,17 @@ def withdraw_money(access_token, amount):
         "amount": int(amount),
         "otp": ""
     }
+    
     try:
         res = requests.post(url, headers=headers, json=payload, timeout=12)
         if res.status_code in (200, 201):
             res_data = res.json()
-            if res_data.get('success', True): # Nếu API trả về thành công
-                return True, f"Rút thành công {amount:,}đ về STK {WITHDRAW_BANK_NUMBER} ({WITHDRAW_BANK_TYPE})"
-            return False, res_data.get('message', 'Lỗi phản hồi từ API rút tiền.')
+            if res_data.get('success', True): 
+                return True, f"Rút thành công {amount:,}đ"
+            return False, res_data.get('message', 'Lỗi từ game')
         return False, f"Mã lỗi HTTP: {res.status_code}"
     except Exception as e:
-        return False, f"Ngoại lệ kết nối rút tiền: {e}"
+        return False, f"Lỗi kết nối: {e}"
 
 def update_result(chat_id, store, data, label):
     state = store[chat_id]
